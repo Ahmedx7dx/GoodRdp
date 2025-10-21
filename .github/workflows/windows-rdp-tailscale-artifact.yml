@@ -1,0 +1,155 @@
+name: RDP via Tailscale (with .rdp artifact)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+    env:
+      # ضع هذا secret في Settings -> Secrets and variables -> Actions
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      # أنصح بوضع الباسورد كـ secret باسم RDP_PASSWORD؛ إذا لم يوجد سيستخدم القيمة الافتراضية التالية:
+      RDP_USER: TOOLBOXLAP
+      RDP_PASS: ${{ secrets.RDP_PASSWORD || 'admin@123' }}
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          Write-Host 'Configuring RDP...'
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" -ErrorAction SilentlyContinue
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+          Write-Host 'RDP configured.'
+
+      - name: Create RDP User with Static Password
+        shell: powershell
+        run: |
+          $password = "${{ env.RDP_PASS }}"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "${{ env.RDP_USER }}" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          } else {
+              # update password if exists
+              $u = Get-LocalUser -Name "${{ env.RDP_USER }}"
+              $u | Set-LocalUser -Password $securePass
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue
+
+          if (-not (Get-LocalUser -Name "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue)) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+          Write-Host "RDP user ready: $($env:RDP_USER)"
+
+      - name: Install Tailscale (MSI)
+        shell: powershell
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.msi"
+          $out = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          Start-Process -FilePath "msiexec.exe" -ArgumentList "/i", "`"$out`"", "/qn", "/norestart" -Wait
+          Remove-Item $out -Force -ErrorAction SilentlyContinue
+          Write-Host "Tailscale installed."
+
+      - name: Bring up Tailscale with authkey
+        shell: powershell
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tsExe)) {
+            $tsExe = (Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $tsExe) { throw "tailscale.exe not found after install." }
+
+          if (-not $env:TAILSCALE_AUTH_KEY) { throw "TAILSCALE_AUTH_KEY is empty - add it to repo secrets." }
+
+          Write-Host "Starting tailscale up..."
+          & $tsExe up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="gh-runner-${{ github.run_id }}" || (Start-Sleep -Seconds 2; & $tsExe up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="gh-runner-${{ github.run_id }}")
+          Start-Sleep -Seconds 4
+
+          $tries = 0
+          $tsIP = $null
+          while (-not $tsIP -and $tries -lt 20) {
+              try { $tsIP = (& $tsExe ip -4).Trim() } catch { $tsIP = $null }
+              if ($tsIP -and $tsIP -ne "") { break }
+              Start-Sleep -Seconds 3
+              $tries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Showing status for debug:"
+              & $tsExe status || Write-Host "tailscale status failed"
+              exit 1
+          }
+
+          Write-Host "Tailscale IP: $tsIP"
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        shell: powershell
+        run: |
+          $ip = $env:TAILSCALE_IP
+          Write-Host "Testing TCP 3389 to $ip ..."
+          $test = Test-NetConnection -ComputerName $ip -Port 3389 -WarningAction SilentlyContinue
+          if (-not $test.TcpTestSucceeded) {
+            Write-Error "TCP connection to RDP port 3389 failed. Test result:"
+            $test | Format-List | Out-String | Write-Host
+            exit 1
+          }
+          Write-Host "TCP connectivity successful."
+
+      - name: Create .rdp file (artifact) for one-click connect
+        shell: powershell
+        run: |
+          $ip = $env:TAILSCALE_IP
+          $user = $env:RDP_USER
+          $rdpPath = Join-Path $env:GITHUB_WORKSPACE "gh-runner-${{ github.run_id }}.rdp"
+          # Create a basic .rdp file. It will prompt for credentials when opened unless credential prompt disabled.
+          $content = @"
+screen mode id:i:2
+use multimon:i:0
+desktopwidth:i:1280
+desktopheight:i:720
+session bpp:i:32
+auto connect:i:1
+full address:s:$ip:3389
+username:s:.\$user
+redirectclipboard:i:1
+authentication level:i:0
+prompt for credentials:i:1
+"@
+          $content | Out-File -FilePath $rdpPath -Encoding ASCII
+          Write-Host "Created .rdp at $rdpPath"
+          echo "RDP_RDPFILE=$rdpPath" >> $env:GITHUB_ENV
+
+      - name: Upload .rdp artifact (download to client)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-connection
+          path: ${{ env.GITHUB_WORKSPACE }}/*.rdp
+
+      - name: Print connection details
+        shell: powershell
+        run: |
+          Write-Host "===== RDP ACCESS INFO ====="
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "Downloaded artifact name: rdp-connection (contains the .rdp file)."
+          Write-Host "Go to the Actions run -> Artifacts -> download the .rdp and open it (mstsc will prompt for credentials)."
+          Write-Host "==========================="
+
+      - name: Maintain Connection
+        shell: powershell
+        run: |
+          Write-Host "Maintaining session until timeout. Press Cancel on the workflow to stop."
+          while ($true) { Start-Sleep -Seconds 60 }
